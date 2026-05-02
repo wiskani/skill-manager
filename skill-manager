@@ -12,11 +12,16 @@ RESET='\033[0m'
 
 die()  { echo -e "${RED}error: $1${RESET}" >&2; exit 1; }
 ok()   { echo -e "  ${GREEN}✓${RESET} $1"; }
-warn() { echo -e "  ${YELLOW}!${RESET} $1"; }
+warn() { echo -e "  ${YELLOW}⚠${RESET} $1"; }
+err()  { echo -e "  ${RED}✗${RESET} $1"; }
+
+# Load Claude Code conventions (update these files if Anthropic changes paths or format)
+SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "$SELF_DIR/claude-defaults.sh"
+source "$SELF_DIR/claude-schema.sh"
 
 CONF_FILE=".claude/.skill-manager.conf"
 MANIFEST_FILE=".claude/.skill-manifest"
-COMMANDS_DIR=".claude/commands"
 
 # ---------------------------------------------------------------------------
 # Config
@@ -70,14 +75,69 @@ get_field() {
   ' "$file"
 }
 
-strip_frontmatter() {
-  awk 'BEGIN{n=0} /^---/{n++; next} n>=2{print}' "$1"
+# ---------------------------------------------------------------------------
+# Validation
+# Populates globals VALIDATION_ERRORS and VALIDATION_WARNINGS.
+# Returns 0 if valid (errors=0), 1 if invalid.
+# ---------------------------------------------------------------------------
+
+VALIDATION_ERRORS=()
+VALIDATION_WARNINGS=()
+
+validate_skill() {
+  local name="$1" dir="$2"
+  local md="$dir/SKILL.md"
+  VALIDATION_ERRORS=()
+  VALIDATION_WARNINGS=()
+
+  # frontmatter: must have at least two --- delimiters
+  local fence_count
+  fence_count=$(awk '/^---/{c++} END{print c+0}' "$md")
+  if [[ $fence_count -lt 2 ]]; then
+    VALIDATION_ERRORS+=("missing frontmatter delimiters (---)")
+  fi
+
+  # name field: if present must match SCHEMA_NAME_REGEX
+  local name_val
+  name_val=$(get_field "$md" "name")
+  if [[ -n "$name_val" ]] && ! echo "$name_val" | grep -qE "$SCHEMA_NAME_REGEX"; then
+    VALIDATION_ERRORS+=("invalid name '$name_val' — must match: $SCHEMA_NAME_REGEX")
+  fi
+
+  # effort field: if present must be one of SCHEMA_EFFORT_ALLOWED
+  local effort_val
+  effort_val=$(get_field "$md" "effort")
+  if [[ -n "$effort_val" ]] && ! echo " $SCHEMA_EFFORT_ALLOWED " | grep -qw "$effort_val"; then
+    VALIDATION_ERRORS+=("invalid effort '$effort_val' — must be one of: $SCHEMA_EFFORT_ALLOWED")
+  fi
+
+  # context field: if present must be one of SCHEMA_CONTEXT_ALLOWED
+  local context_val
+  context_val=$(get_field "$md" "context")
+  if [[ -n "$context_val" ]] && ! echo " $SCHEMA_CONTEXT_ALLOWED " | grep -qw "$context_val"; then
+    VALIDATION_ERRORS+=("invalid context '$context_val' — must be one of: $SCHEMA_CONTEXT_ALLOWED")
+  fi
+
+  # description: recommended, warn if missing
+  local desc_val
+  desc_val=$(get_field "$md" "description")
+  if [[ -z "$desc_val" ]]; then
+    VALIDATION_WARNINGS+=("no description field (recommended for skill discovery)")
+  fi
+
+  [[ ${#VALIDATION_ERRORS[@]} -eq 0 ]]
 }
+
+# ---------------------------------------------------------------------------
+# Build skill list with validation status
+# ---------------------------------------------------------------------------
 
 build_skill_list() {
   SKILL_NAMES=()
   SKILL_DIRS=()
   SKILL_DESCS=()
+  SKILL_STATUS=()   # "ok" | "warn" | "error"
+  SKILL_ISSUES=()   # first error or warning message
 
   for dir in "$SKILLS_DIR"/*/; do
     if [[ ! -d "$dir" ]]; then continue; fi
@@ -89,9 +149,26 @@ build_skill_list() {
     desc=$(get_field "$md" "description")
     desc="${desc:0:65}"
 
+    local status issue
+    if validate_skill "$name" "$dir"; then
+      if [[ ${#VALIDATION_WARNINGS[@]} -gt 0 ]]; then
+        status="warn"
+        issue="${VALIDATION_WARNINGS[0]}"
+      else
+        status="ok"
+        issue=""
+      fi
+    else
+      status="error"
+      issue="${VALIDATION_ERRORS[0]}"
+      desc="—"
+    fi
+
     SKILL_NAMES+=("$name")
     SKILL_DIRS+=("$dir")
     SKILL_DESCS+=("$desc")
+    SKILL_STATUS+=("$status")
+    SKILL_ISSUES+=("$issue")
   done
 }
 
@@ -103,47 +180,50 @@ is_active() {
   return 1
 }
 
-active_mark() {
-  local name="$1"
-  if is_active "$name"; then
+skill_prefix() {
+  local i="$1"
+  local status="${SKILL_STATUS[$i]}"
+  if [[ "$status" == "error" ]]; then
+    echo "${RED} ✗ ${RESET}"
+  elif is_active "${SKILL_NAMES[$i]}"; then
     echo "${GREEN} ✓ ${RESET}"
+  elif [[ "$status" == "warn" ]]; then
+    echo "${YELLOW} ⚠ ${RESET}"
   else
     echo "   "
   fi
 }
 
 # ---------------------------------------------------------------------------
-# Install a skill into .claude/commands/
+# Install / remove a skill
 # ---------------------------------------------------------------------------
 
 install_skill() {
-  local name="$1" dir="$2"
-  local out="$COMMANDS_DIR/$name.md"
+  local name="$1" src_dir="$2"
+  local dest="$CLAUDE_SKILLS_DIR/$name"
 
-  strip_frontmatter "$dir/SKILL.md" > "$out"
-
-  for extra in "$dir"*.md; do
-    if [[ -f "$extra" && "$(basename "$extra")" != "SKILL.md" ]]; then
-      { echo ""; echo "---"; cat "$extra"; } >> "$out"
-    fi
-  done
-
-  if [[ -d "${dir}references" ]]; then
-    for ref in "${dir}references"/*.md; do
-      if [[ -f "$ref" ]]; then
-        { echo ""; echo "---"; cat "$ref"; } >> "$out"
-      fi
-    done
-  fi
+  mkdir -p "$CLAUDE_SKILLS_DIR"
+  rm -rf "$dest"
+  cp -r "$src_dir" "$dest"
 
   if ! grep -qx "$name" "$MANIFEST_FILE" 2>/dev/null; then
     echo "$name" >> "$MANIFEST_FILE"
   fi
-  ok "$name → $out"
+  ok "$name → $dest/"
+}
+
+remove_skill() {
+  local name="$1"
+  local dest="$CLAUDE_SKILLS_DIR/$name"
+  if [[ -d "$dest" ]]; then
+    rm -rf "$dest"
+    return 0
+  fi
+  return 1
 }
 
 # ---------------------------------------------------------------------------
-# Cleanup skills from previous session (silent)
+# Cleanup skills from previous session (runs automatically on activate)
 # ---------------------------------------------------------------------------
 
 cleanup_previous() {
@@ -153,9 +233,7 @@ cleanup_previous() {
   local removed=0
   while IFS= read -r name; do
     if [[ -z "$name" ]]; then continue; fi
-    local file="$COMMANDS_DIR/$name.md"
-    if [[ -f "$file" ]]; then
-      rm "$file"
+    if remove_skill "$name"; then
       removed=$((removed + 1))
     fi
   done < "$MANIFEST_FILE"
@@ -176,10 +254,13 @@ cmd_list() {
 
   echo -e "\n${BOLD}Skills in $SKILLS_DIR (${#SKILL_NAMES[@]}):${RESET}\n"
   for i in "${!SKILL_NAMES[@]}"; do
-    local mark
-    mark=$(active_mark "${SKILL_NAMES[$i]}")
-    printf "${mark}${CYAN}[%2d]${RESET} %-36s %s\n" \
+    local prefix
+    prefix=$(skill_prefix "$i")
+    printf "${prefix}${CYAN}[%2d]${RESET} %-36s %s\n" \
       $((i+1)) "${SKILL_NAMES[$i]}" "${SKILL_DESCS[$i]}"
+    if [[ -n "${SKILL_ISSUES[$i]}" ]]; then
+      printf "        ${YELLOW}%s${RESET}\n" "${SKILL_ISSUES[$i]}"
+    fi
   done
   echo ""
 }
@@ -194,10 +275,13 @@ cmd_activate() {
 
   echo -e "\n${BOLD}Available skills (${#SKILL_NAMES[@]}):${RESET}\n"
   for i in "${!SKILL_NAMES[@]}"; do
-    local mark
-    mark=$(active_mark "${SKILL_NAMES[$i]}")
-    printf "${mark}${CYAN}[%2d]${RESET} %-36s %s\n" \
+    local prefix
+    prefix=$(skill_prefix "$i")
+    printf "${prefix}${CYAN}[%2d]${RESET} %-36s %s\n" \
       $((i+1)) "${SKILL_NAMES[$i]}" "${SKILL_DESCS[$i]}"
+    if [[ -n "${SKILL_ISSUES[$i]}" ]]; then
+      printf "        ${YELLOW}%s${RESET}\n" "${SKILL_ISSUES[$i]}"
+    fi
   done
 
   echo -e "\n${YELLOW}Select (e.g: 1 3 5  |  1-4  |  all):${RESET} "
@@ -219,21 +303,34 @@ cmd_activate() {
     done
   fi
 
-  mkdir -p "$COMMANDS_DIR"
+  mkdir -p "$CLAUDE_SKILLS_DIR"
   touch "$MANIFEST_FILE"
 
-  local count=0
+  local count=0 skipped=0
   echo ""
   for idx in "${indices[@]}"; do
     if [[ $idx -lt 0 || $idx -ge ${#SKILL_NAMES[@]} ]]; then
       warn "index $((idx+1)) out of range — skipped"
       continue
     fi
-    install_skill "${SKILL_NAMES[$idx]}" "${SKILL_DIRS[$idx]}"
+    local name="${SKILL_NAMES[$idx]}"
+    if [[ "${SKILL_STATUS[$idx]}" == "error" ]]; then
+      err "$name — skipped: ${SKILL_ISSUES[$idx]}"
+      skipped=$((skipped + 1))
+      continue
+    fi
+    install_skill "$name" "${SKILL_DIRS[$idx]}"
     count=$((count + 1))
   done
 
-  echo -e "\n${GREEN}${BOLD}$count skill(s) activated.${RESET} Use them as ${BOLD}/<name>${RESET} in Claude Code.\n"
+  echo ""
+  if [[ $count -gt 0 ]]; then
+    echo -e "${GREEN}${BOLD}$count skill(s) activated.${RESET} Use them as ${BOLD}/<name>${RESET} in Claude Code."
+  fi
+  if [[ $skipped -gt 0 ]]; then
+    echo -e "${RED}$skipped skill(s) skipped due to validation errors.${RESET}"
+  fi
+  echo ""
 }
 
 cmd_active() {
@@ -262,10 +359,8 @@ cmd_deactivate() {
   echo ""
   while IFS= read -r name; do
     if [[ -z "$name" ]]; then continue; fi
-    local file="$COMMANDS_DIR/$name.md"
-    if [[ -f "$file" ]]; then
-      rm "$file"
-      echo -e "  ${RED}✗${RESET} removed $file"
+    if remove_skill "$name"; then
+      echo -e "  ${RED}✗${RESET} removed $CLAUDE_SKILLS_DIR/$name/"
       count=$((count + 1))
     fi
   done < "$MANIFEST_FILE"
@@ -324,7 +419,7 @@ ${BOLD}Usage:${RESET}
   skill-manager <command>
 
 ${BOLD}Commands:${RESET}
-  activate         Interactive skill selection (asks skills path on first run)
+  activate         Interactive skill selection (clears previous session first)
   deactivate       Remove skills activated in this repo
   active           Show currently active skills
   list             List all available skills with status
@@ -332,14 +427,14 @@ ${BOLD}Commands:${RESET}
   config reset     Clear config (re-asks on next activate)
   version          Show version
 
-${BOLD}First run in a new repo:${RESET}
-  cd your-project
-  skill-manager activate
-  → Skills directory (relative path from repo root): .agents/skills
+${BOLD}Skill status indicators:${RESET}
+  ${GREEN}✓${RESET}  active
+  ${YELLOW}⚠${RESET}  valid with warnings (e.g. missing description)
+  ${RED}✗${RESET}  invalid — will be skipped on activate
 
 ${BOLD}Config saved to:${RESET}  .claude/.skill-manager.conf
-${BOLD}Skills output:${RESET}    .claude/commands/<name>.md
-${BOLD}Both paths are local-only — add .claude/ to .gitignore${RESET}
+${BOLD}Skills output:${RESET}    $CLAUDE_SKILLS_DIR/<name>/
+${BOLD}Both paths are local-only — add **/.claude/ to .gitignore${RESET}
 "
     ;;
 esac
