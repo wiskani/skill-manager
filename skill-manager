@@ -314,7 +314,16 @@ cmd_start() {
   check_skills_dir
   build_skill_list
 
-  [[ ${#SKILL_NAMES[@]} -gt 0 ]] || die "no skills found"
+  while [[ ${#SKILL_NAMES[@]} -eq 0 ]]; do
+    warn "no skills found in '$SKILLS_DIR'"
+    echo -e "${CYAN}Enter a different skills directory (or press Enter to abort):${RESET} "
+    read -r input
+    [[ -n "$input" ]] || die "aborted — reset config with: skill-manager config reset"
+    SKILLS_DIR="${input%/}"
+    if [[ ! -d "$SKILLS_DIR" ]]; then err "directory not found: '$SKILLS_DIR'"; continue; fi
+    save_config
+    build_skill_list
+  done
 
   # Clear previous session
   if [[ -f "$MANIFEST_FILE" && -s "$MANIFEST_FILE" ]]; then
