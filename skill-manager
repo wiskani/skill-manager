@@ -46,17 +46,32 @@ ensure_config() {
   load_config
   if [[ -z "$SKILLS_DIR" ]]; then
     echo -e "\n${BOLD}First time setup for this repo${RESET}"
-    echo -e "${CYAN}Skills directory (relative path from repo root):${RESET} "
-    read -r input
-    [[ -n "$input" ]] || die "path cannot be empty"
-    SKILLS_DIR="${input%/}"
+    while true; do
+      echo -e "${CYAN}Skills directory (relative path from repo root):${RESET} "
+      read -r input
+      [[ -n "$input" ]] || die "path cannot be empty"
+      local candidate="${input%/}"
+      if [[ -d "$candidate" ]]; then
+        SKILLS_DIR="$candidate"
+        break
+      fi
+      err "directory not found: '$candidate'"
+    done
     save_config
     echo ""
   fi
 }
 
 check_skills_dir() {
-  [[ -d "$SKILLS_DIR" ]] || die "skills directory not found: '$SKILLS_DIR'\n       run from repo root or reset with: skill-manager config reset"
+  if [[ ! -d "$SKILLS_DIR" ]]; then
+    warn "skills directory not found: '$SKILLS_DIR'"
+    echo -e "${CYAN}Enter a new path (or press Enter to abort):${RESET} "
+    read -r input
+    if [[ -z "$input" ]]; then die "aborted — reset config with: skill-manager config reset"; fi
+    SKILLS_DIR="${input%/}"
+    [[ -d "$SKILLS_DIR" ]] || die "directory not found: '$SKILLS_DIR'"
+    save_config
+  fi
 }
 
 # ---------------------------------------------------------------------------
